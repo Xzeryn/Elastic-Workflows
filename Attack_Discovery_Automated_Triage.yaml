@@ -1,0 +1,600 @@
+# =============================================================================
+# Workflow: 🔒 AD - Automated Triaging
+# Category: security/response
+#
+# The YAML workflow outlines an automated triaging process for security
+# operations, specifically designed to handle attack discoveries. It triggers
+# on alerts, creating cases in Kibana, analyzing the incidents with AI, and
+# executing remediation steps such as isolating affected hosts and notifying
+# the team via Slack. The workflow includes detailed steps for gathering
+# alert information, generating AI-driven analysis, and consolidating
+# findings into a structured format for effective incident response.
+#
+# Author: Elastic
+# Created: 2025-11-07
+# Tags: Example, Agentic Workflow, SOC Agent
+# =============================================================================
+version: '1'
+name: 🔒 AD - Automated Triaging v2
+description: A workflow to automatically process attack discoveries, create cases, analyze with AI, and execute remediation steps
+enabled: true
+
+# ---------------------------------------------------------------------------
+# TAGS
+# ---------------------------------------------------------------------------
+# Categories and labels for organizing, filtering, and discovering workflows
+# in the Kibana UI. Tags help with:
+#   - Categorizing workflows by use case (security, observability, etc.)
+#   - Filtering in the workflow library
+#   - Grouping related workflows together
+# ---------------------------------------------------------------------------
+tags:
+  - Example
+  - Agentic Workflow
+  - SOC Agent
+
+# ---------------------------------------------------------------------------
+# TRIGGERS
+# ---------------------------------------------------------------------------
+# Defines how and when this workflow is executed. Supported trigger types:
+#   - manual: Run on-demand from the Kibana UI or API
+#   - scheduled: Run on a recurring schedule (every: "5m" or rrule)
+#   - alert: Run automatically when a security alert is triggered
+# ---------------------------------------------------------------------------
+triggers:
+  - type: alert
+
+# ---------------------------------------------------------------------------
+# STEPS
+# ---------------------------------------------------------------------------
+# The sequence of actions this workflow performs. Each step executes an
+# action and can reference outputs from previous steps. Key properties:
+#   - name: Unique identifier for referencing this step's output
+#   - type: The action to perform (http, elasticsearch.search, foreach, etc.)
+#   - with: Parameters passed to the action
+#   - condition: Optional expression to conditionally run the step
+#   - on-failure: Error handling configuration (retry, continue, etc.)
+# Access step outputs using {{ steps.step_name.output.field }} syntax
+# ---------------------------------------------------------------------------
+steps:
+
+  # -------------------------------------------------------------------------
+  # STEP 0: debug_event
+  # -------------------------------------------------------------------------
+  # Outputs the full event payload to the workflow execution log.
+  # Useful for debugging and understanding the event structure.
+  # -------------------------------------------------------------------------
+  - name: debug_event
+    type: console
+    with:
+      message: "{{ event | json }}"
+
+  # -------------------------------------------------------------------------
+  # STEP 1: for_each_discovery
+  # -------------------------------------------------------------------------
+  # Iterates over a collection of items, executing the nested steps for each.
+  # Access the current item via {{ item }} within the loop body.
+  # -------------------------------------------------------------------------
+  - name: for_each_discovery
+    type: foreach
+    foreach: '{{ event.alerts }}'
+    steps:
+
+      # -------------------------------------------------------------------------
+      # STEP 2: Create Case
+      # -------------------------------------------------------------------------
+      # -------------------------------------------------------------------------
+      # STEP 2.1: format_description
+      # -------------------------------------------------------------------------
+      # Reformats the Attack Discovery markdown fields to replace template
+      # syntax with proper markdown backticks.
+      # Converts: {{ field_name value }} -> `value`
+      # This is a simple text transformation with no tool calls.
+      # Output: {{ steps.format_description.output.message }}
+      # -------------------------------------------------------------------------
+      - name: format_description
+        type: ai.agent
+        agent-id: elastic-security-agent
+        connector-id: .google-gemini-3.5-flash-chat_completion
+        with:
+          message: |
+              Reformat the following text by converting all template syntax to markdown backticks.
+
+              RULES:
+              - Convert any pattern like {{ field_name value }} to just `value` in backticks
+              - For example: {{ host.name server01 }} becomes `server01`
+              - For example: {{ process.name wget }} becomes `wget`
+              - For example: {{ user.name john }} becomes `john`
+              - Keep ALL other markdown formatting exactly as-is (headers, bullets, bold, etc.)
+              - Output ONLY the reformatted text, nothing else
+
+              TEXT TO REFORMAT:
+              ## Attack Summary
+              {{ foreach.item.kibana.alert.attack_discovery.summary_markdown_with_replacements }}
+
+              ## Detailed Analysis
+              {{ foreach.item.kibana.alert.attack_discovery.details_markdown_with_replacements }}
+
+              ## Affected Entities
+              {{ foreach.item.kibana.alert.attack_discovery.entity_summary_markdown_with_replacements }}
+
+              ## Investigation Context
+              - **Discovery ID:** {{ foreach.item._id }}
+              - **Detection Time:** {{ foreach.item.kibana.alert.start }}
+              - **Alert Count:** {{ foreach.item.kibana.alert.attack_discovery.alerts_context_count }}
+              - **Risk Score:** {{ foreach.item.kibana.alert.risk_score }}
+              - **Rule:** {{ foreach.item.kibana.alert.rule.name }}
+
+              ## View Full Discovery
+              {{ foreach.item.kibana.alert.url }}
+      
+      # -------------------------------------------------------------------------
+      # STEP 2.2: create_case
+      # -------------------------------------------------------------------------
+      # Creates a new case using the Kibana Cases API (POST /api/cases).
+      # Cases provide a workspace for investigating and tracking security
+      # incidents.
+      # Required: title, description, owner (e.g., "securitySolution"), tags,
+      # severity.
+      # Output: {{ steps.create_case.output.case.id }} contains the new case ID.
+      # Liquid syntax used:
+      # - References current item in foreach loop
+      # -------------------------------------------------------------------------
+      - name: create_case
+        type: cases.createCase
+        with:
+          owner: securitySolution
+          title: '[Attack Discovery] {{ foreach.item.kibana.alert.attack_discovery.title_with_replacements }}'
+          description: '{{ steps.format_description.output.message }}'
+          tags:
+            - '{{foreach.item.kibana.alert.attack_discovery.mitre_attack_tactics}}'
+          settings:
+            syncAlerts: true
+            extractObservables: true
+          severity: high
+
+      # -------------------------------------------------------------------------
+      # STEP 3: foreach_alert_in_ad
+      # -------------------------------------------------------------------------
+      # Iterates over a collection of items, executing the nested steps for each.
+      # Access the current item via {{ item }} within the loop body.
+      # -------------------------------------------------------------------------
+      - name: foreach_alert_in_ad
+        type: foreach
+        foreach: '{{ foreach.item.kibana.alert.attack_discovery.alert_ids }}'
+        steps:
+
+          # -------------------------------------------------------------------------
+          # STEP 4: get_details
+          # -------------------------------------------------------------------------
+          # Executes a search query against one or more Elasticsearch indices.
+          # Uses the Query DSL to define match criteria for documents.
+          # Output: {{ steps.get_details.output.hits }} contains matching documents.
+          # Liquid syntax used:
+          # - References current item in foreach loop
+          # -------------------------------------------------------------------------
+          - name: get_details
+            type: elasticsearch.search
+            with:
+              index: .alerts-security.alerts-default
+              size: 10
+              query:
+                match:
+                  _id: '{{ foreach.item }}'
+
+          # -------------------------------------------------------------------------
+          # STEP 5: add_to_case
+          # -------------------------------------------------------------------------
+          # Attaches a security alert to a case via cases.addAlerts.
+          # Links the alert to the case for consolidated investigation tracking.
+          # Required fields: case_id, alerts[].alertId, alerts[].index,
+          # alerts[].rule (id and name).
+          # Liquid syntax used:
+          # - References output from previous step(s)
+          # - References current item in foreach loop
+          # -------------------------------------------------------------------------
+          - name: add_to_case
+            type: cases.addAlerts
+            with:
+              case_id: '{{ steps.create_case.output.case.id }}'
+              alerts:
+                - alertId: '{{ foreach.item }}'
+                  index: .alerts-security.alerts-default
+                  rule:
+                    name: '{{ steps.get_details.output.hits.hits[0]._source.kibana.alert.rule.name }}'
+                    id: '{{ steps.get_details.output.hits.hits[0]._source.kibana.alert.rule.uuid }}'
+
+      # -------------------------------------------------------------------------
+      # STEP 7: triage_analysis
+      # -------------------------------------------------------------------------
+      # THREAD 1, TURN 1: Initial Analysis
+      # Sends the attack discovery data to the Security Agent for initial
+      # threat assessment. This turn establishes the conversation and captures
+      # the conversation_id for the remediation follow-up.
+      # Output: {{ steps.triage_analysis.output.conversation_id }} for threading
+      # Output: {{ steps.triage_analysis.output.response.message }} for analysis
+      # -------------------------------------------------------------------------
+      - name: triage_analysis
+        type: ai.agent
+        agent-id: elastic-security-agent
+        create-conversation: true
+        with:
+          message: |
+              Analyze the following attack discovery and provide an initial threat assessment.
+
+              IMPORTANT FORMATTING RULES:
+              - When referencing entities like hosts, users, processes, files, or any field values, use markdown backticks for readability
+              - For example, write `server01` instead of using template syntax with the field name
+              - For example, write `wget` instead of using template syntax with process.name
+              - This applies to ALL entity references in your response - just use the actual value in backticks
+              - Initial headers # and ## are being provided in later formatting, start markdown header formatting with ###
+
+              Please provide:
+              1. A clear summary of the attack chain and what occurred
+              2. The MITRE ATT&CK tactics and techniques involved
+              3. Any relevant information from Elastic Security Labs about similar attacks
+              4. Initial risk assessment
+
+              <detected attack>
+              {{ foreach.item | json }}
+              </detected attack>
+
+      # -------------------------------------------------------------------------
+      # STEP 8: extract_iocs_and_add_to_case
+      # -------------------------------------------------------------------------
+      - name: extract_iocs
+        type: ai.agent
+        agent-id: elastic-security-agent
+        with:
+          conversation_id: "{{ steps.triage_analysis.output.conversation_id }}"
+          message: |
+            Based on your analysis, extract all indicators of compromise (IOCs) and
+            artifacts from the alert and return them as a structured list.
+
+            For each observable you find, include:
+              - typeKey: one of the following exact values (use only what applies):
+                  observable-type-agent-id
+                  observable-type-domain
+                  observable-type-email
+                  observable-type-file-hash
+                  observable-type-file-path
+                  observable-type-hostname
+                  observable-type-ipv4
+                  observable-type-ipv6
+                  observable-type-url
+              - value: the observable value (e.g. the actual hash, hostname, IP, etc.)
+              - description: (optional) a short label, e.g. the file name for a hash,
+                or the field it came from
+
+            Only include observables for which you have concrete evidence in the alert
+            data. Do not fabricate or guess values. If a type has no evidence, omit it
+            entirely — do not include it with an empty value.
+          schema:
+            type: "object"
+            properties:
+              observables:
+                type: "array"
+                items:
+                  type: "object"
+                  properties:
+                    typeKey:
+                      type: "string"
+                    value:
+                      type: "string"
+                    description:
+                      type: "string"
+                  required:
+                    - typeKey
+                    - value
+
+      - name: add_iocs_to_case
+        type: foreach
+        foreach: "{{ steps.extract_iocs.output.structured_output.observables }}"
+        steps:
+          - name: add_observable
+            type: cases.addObservables
+            with:
+              case_id: "{{ steps.create_case.output.case.id }}"
+              observables:
+                - typeKey: "{{ foreach.item.typeKey }}"
+                  value: "{{ foreach.item.value }}"
+                  description: "{{ foreach.item.description }}"
+
+      # -------------------------------------------------------------------------
+      # STEP 9: triage_remediation
+      # -------------------------------------------------------------------------
+      # THREAD 1, TURN 2: Remediation Guidance
+      # Continues the conversation to get specific remediation steps and
+      # Elastic Defend response console commands.
+      # Uses conversation_id from Turn 1 to maintain context.
+      # -------------------------------------------------------------------------
+      - name: triage_remediation
+        type: ai.agent
+        agent-id: elastic-security-agent
+        with:
+          conversation_id: "{{ steps.triage_analysis.output.conversation_id }}"
+          message: |
+              Based on your analysis, provide detailed remediation guidance.
+
+              IMPORTANT FORMATTING RULES:
+              - When referencing entities like hosts, users, processes, files, or any field values, use markdown backticks for readability
+              - For example, write `server01` instead of using template syntax with the field name
+              - For example, write `wget` instead of using template syntax with process.name
+              - This applies to ALL entity references in your response - just use the actual value in backticks
+              - Initial headers # and ## are being provided in later formatting, start markdown header formatting with ###
+
+              Please include:
+              1. Immediate containment steps
+              2. Specific Elastic Defend Response Console commands that can be run to remediate this threat (output each command as a separate code block)
+              3. Steps to prevent similar attacks in the future
+              4. Any artifacts that should be collected for forensic analysis
+
+      # -------------------------------------------------------------------------
+      # STEP 10: triage_esql
+      # -------------------------------------------------------------------------
+      # THREAD 2, TURN 1: ES|QL Queries
+      # Starts a fresh conversation with minimal context to generate ES|QL
+      # queries for further threat hunting.
+      # -------------------------------------------------------------------------
+      - name: triage_esql
+        type: ai.agent
+        agent-id: "esql_query_agent"
+        connector-id: .google-gemini-3.5-flash-chat_completion
+        create-conversation: false
+        with:
+          message: |
+              To not blow up your context window please keep your analysis and data exploration brief.
+
+              Attack: {{ foreach.item.kibana.alert.attack_discovery.title_with_replacements }}
+              Time: {{ foreach.item.kibana.alert.start }}
+
+              IMPORTANT FORMATTING RULES:
+              - When referencing entities like hosts, users, processes, files, or any field values, use markdown backticks for readability
+              - For example, write `server01` instead of using template syntax with the field name
+              - For example, write `wget` instead of using template syntax with process.name
+              - This applies to ALL entity references in your response - just use the actual value in backticks
+              - Initial headers # and ## are being provided in later formatting, start markdown header formatting with ### 
+              - Format as esql code blocks with brief comments.
+
+              Provide 1 to 2 ES|QL queries using logs-* index that focus on finding:
+              1. Related host/user activity
+              2. Similar attack patterns
+              3. Persistence mechanisms
+              4. Lateral movement
+              
+      # -------------------------------------------------------------------------
+      # STEP 11: triage_summary
+      # -------------------------------------------------------------------------
+      - name: triage_summary
+        type: ai.agent
+        agent-id: elastic-security-agent
+        create-conversation: false
+        with:
+          message: |
+              Based on the following completed analysis and remediation guidance for an attack discovery, provide a final summary and confidence assessment.
+
+              IMPORTANT FORMATTING RULES:
+              - When referencing entities like hosts, users, processes, files, or any field values, use markdown backticks for readability
+              - For example, write `server01` instead of using template syntax with the field name
+              - For example, write `wget` instead of using template syntax with process.name
+              - This applies to ALL entity references in your response - just use the actual value in backticks
+              - Initial headers # and ## are being provided in later formatting, start markdown header formatting with ### 
+
+              ## Analysis Already Completed:
+              {{ steps.triage_analysis.output.message }}
+
+              ## Remediation Guidance Already Provided:
+              {{ steps.triage_remediation.output.message }}
+
+              Now provide:
+              1. A confidence score (0-100%) indicating the likelihood this is a true positive vs false positive
+              2. Key factors that influenced your confidence score
+              3. Recommended priority level (Critical, High, Medium, Low)
+              4. A brief executive summary suitable for sharing with stakeholders (2-3 paragraphs)
+
+
+      # -------------------------------------------------------------------------
+      # STEP 12: add_analysis_to_case
+      # -------------------------------------------------------------------------
+      # Adds a comment to a case via cases.addComment.
+      # Comments document investigation findings, analyst notes, or action
+      # summaries.
+      # Liquid syntax used:
+      # - References output from previous step(s)
+      # -------------------------------------------------------------------------
+      - name: add_analysis_to_case
+        type: cases.addComment
+        with:
+          case_id: '{{ steps.create_case.output.case.id }}'
+          comment: |
+              # 🤖 AI Threat Analysis
+
+              ## Initial Analysis
+              {{ steps.triage_analysis.output.message }}
+
+              ---
+
+              ## Remediation Guidance
+              {{ steps.triage_remediation.output.message }}
+
+              ---
+
+              ## ES|QL Queries for Further Investigation
+              {{ steps.triage_esql.output.message}}
+
+              ---
+
+              ## Summary & Confidence Assessment
+              {{ steps.triage_summary.output.message }}
+
+      # -------------------------------------------------------------------------
+      # STEP 13: log_completion
+      # -------------------------------------------------------------------------
+      # Outputs a message to the workflow execution log for visibility.
+      # Confirms successful case creation and AI analysis completion.
+      # -------------------------------------------------------------------------
+      - name: log_completion
+        type: console
+        with:
+          message: 'Case {{ steps.create_case.output.case.id }} created with multi-turn AI analysis'
+
+      
+      # # -------------------------------------------------------------------------
+      # # STEP 14: isolate_host
+      # # -------------------------------------------------------------------------
+      # # Isolates an endpoint from the network via Elastic Defend.
+      # # Isolated hosts can only communicate with Fleet Server for management.
+      # # Required: endpoint_ids array. Optional: comment, case_ids for linking.
+      # # Liquid syntax used:
+      # # - References output from previous step(s)
+      # # - References workflow constant(s)
+      # # -------------------------------------------------------------------------
+      # - name: isolate_host
+      #   type: kibana.request
+      #   with:
+      #     method: POST
+      #     path: /api/endpoint/action/isolate
+      #     body:
+      #       endpoint_ids:
+      #         - 345d5ffc-80a8-413c-9a5d-829687e8a5f2
+      #       comment: >-
+      #         Based on my analysis so far, I've isolated the host in question pending further investigation and
+      #         analysis. As a next step, I'll notify the team.
+      #       case_ids:
+      #         - '{{ steps.create_case.output.case.id }}'
+      #     headers:
+      #       kbn-xsrf: string
+
+      # # -------------------------------------------------------------------------
+      # # STEP 15: notify_team
+      # # -------------------------------------------------------------------------
+      # # Interacts with the Slack API to perform messaging or channel operations.
+      # # Liquid syntax used:
+      # # - References output from previous step(s)
+      # # - References workflow constant(s)
+      # # - References current item in foreach loop
+      # # -------------------------------------------------------------------------
+      # - name: notify_team
+      #   type: http
+      #   with:
+      #     url: '{{ consts.slack_web_hook }}'
+      #     method: POST
+      #     headers:
+      #       content-type: application/json
+      #     body: |
+      #       {
+      #         "blocks": [
+      #           {
+      #             "type": "header",
+      #             "text": {
+      #               "type": "plain_text",
+      #               "text": "🚨 Attack Discovery: {{foreach.item.attack_discovery.title_with_replacements}}",
+      #               "emoji": true
+      #             }
+      #           },
+      #           {
+      #             "type": "section",
+      #             "text": {
+      #               "type": "mrkdwn",
+      #               "text": "{{steps.ai_summary.output.data}} \n"
+      #             }
+      #           },
+      #           {
+      #             "type": "section",
+      #             "text": {
+      #               "type": "mrkdwn",
+      #               "text": "*📝 Current Status:*\n \n• ✅ Security case created with {{foreach.item.attack_discovery.alerts_context_count}} related alerts consolidated for investigation\n• ✅ Initial threat analysis completed by AI security agent\n• ✅ Affected host `srv-win-defend-07` isolated from network pending further review\n• ✅ Forensic data collection and evidence preservation in progress\n• ✅ Incident response workflow initiated with automated triage complete"
+      #             }
+      #           },
+      #           {
+      #             "type": "section",
+      #             "fields": [
+      #               {
+      #                 "type": "mrkdwn",
+      #                 "text": "*Risk Score:* `{{foreach.item.risk_score}}`"
+      #               },
+      #               {
+      #                 "type": "mrkdwn",
+      #                 "text": "*Alert Count:* {{foreach.item.attack_discovery.alerts_context_count}}"
+      #               },
+      #               {
+      #                 "type": "mrkdwn",
+      #                 "text": "*Status:* {{foreach.item.status}}"
+      #               },
+      #               {
+      #                 "type": "mrkdwn",
+      #                 "text": "*Time:* {{foreach.item.start}}"
+      #               }
+      #             ]
+      #           },
+      #           {
+      #             "type": "context",
+      #             "elements": [
+      #               {
+      #                 "type": "mrkdwn",
+      #                 "text": "Case ID: `{{steps.create_case.output.case.id}}` | {{foreach.item.attack_discovery.alerts_context_count}} related alerts | MITRE: {{foreach.item.attack_discovery.mitre_attack_tactics}}"
+      #               }
+      #             ]
+      #           },
+      #           {
+      #             "type": "divider"
+      #           },
+      #           {
+      #             "type": "actions",
+      #             "elements": [
+      #               {
+      #                 "type": "button",
+      #                 "text": {
+      #                   "type": "plain_text",
+      #                   "text": "🔎 View Attack in Kibana",
+      #                   "emoji": true
+      #                 },
+      #                 "style": "primary",
+      #                 "url": "{{foreach.item.url}}"
+      #               },
+      #               {
+      #                 "type": "button",
+      #                 "text": {
+      #                   "type": "plain_text",
+      #                   "text": "📁 Go to Case",
+      #                   "emoji": true
+      #                 },
+      #                 "url": "{{consts.kibana}}/app/security/cases/{{steps.create_case.output.case.id}}"
+      #               },
+      #               {
+      #                 "type": "button",
+      #                 "text": {
+      #                   "type": "plain_text",
+      #                   "text": "💻 View Host",
+      #                   "emoji": true
+      #                 },
+      #                 "url": "{{consts.kibana}}/app/security/administration/endpoints?agent_ids=345d5ffc-80a8-413c-9a5d-829687e8a5f2"
+      #               },
+      #               {
+      #                 "type": "button",
+      #                 "text": {
+      #                   "type": "plain_text",
+      #                   "text": "🤖 View Workflow Execution",
+      #                   "emoji": true
+      #                 },
+      #                 "url": "{{consts.kibana}}/app/workflows/{{ workflow.id }}?executionId={{ execution.id }}&tab=executions"
+      #               }
+      #             ]
+      #           }
+      #         ]
+      #       }
+      #     timeout: 30s
+
+# ---------------------------------------------------------------------------
+# CONSTANTS
+# ---------------------------------------------------------------------------
+# Reusable configuration values defined once and referenced throughout the
+# workflow using {{ consts.key_name }} syntax. Use constants for:
+#   - API endpoints and URLs
+#   - API keys and authentication tokens (use secrets in production)
+#   - Environment-specific configuration
+#   - Values that may need to change across environments
+# ---------------------------------------------------------------------------
+consts:
+  kibana: https://your-deployment.elastic-cloud.com
+  slack_web_hook: https://hooks.slack.YOUR-API-KEY-HERE
